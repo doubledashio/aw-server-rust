@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
+use reqwest::header::AUTHORIZATION;
+use reqwest::header::CONTENT_TYPE;
+use reqwest::StatusCode;
+
 use rocket::http::Header;
 use rocket::http::Status;
 use rocket::response::Response;
@@ -39,5 +43,53 @@ pub fn buckets_export(state: State<ServerState>) -> Result<Response, HttpErrorJs
         .sized_body(Cursor::new(
             serde_json::to_string(&export).expect("Failed to serialize"),
         ))
+        .finalize())
+}
+
+#[get("/")]
+pub fn buckets_export_espaceun(state: State<ServerState>) -> Result<Response, HttpErrorJson> {
+    let datastore = endpoints_get_lock!(state.datastore);
+    let mut export = BucketsExport {
+        buckets: HashMap::new(),
+    };
+    let mut buckets = match datastore.get_buckets() {
+        Ok(buckets) => buckets,
+        Err(err) => return Err(err.into()),
+    };
+    for (bid, mut bucket) in buckets.drain() {
+        let events = match datastore.get_events(&bid, None, None, None) {
+            Ok(events) => events,
+            Err(err) => return Err(err.into()),
+        };
+        bucket.events = Some(TryVec::new(events));
+        export.buckets.insert(bid, bucket);
+    }
+
+    let mut form = HashMap::new();
+    form.insert("content_json", base64::encode(serde_json::to_string(&export).expect("Failed to serialize")));
+
+    let client = reqwest::blocking::Client::new();
+    let res = match client.post("https://espaceun.uqam.ca/rest-v1/activity-watch/add/")
+        .header(AUTHORIZATION, "Basic ZG91YmxlZGFzaGF3c2VjcmV0aWQ=")
+        .header(CONTENT_TYPE, "application/json")
+        .form(&form)
+        .send() {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Query failed: {:?}", e);
+                return Err(HttpErrorJson::new(
+                    Status::InternalServerError,
+                    e.to_string(),
+                ));
+            }
+        };
+
+    let resp_status = match res.status() {
+        StatusCode::OK => Status::Ok,
+        _s => Status::BadRequest
+    };
+
+    Ok(Response::build()
+        .status(resp_status)
         .finalize())
 }
